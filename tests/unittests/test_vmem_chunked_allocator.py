@@ -557,6 +557,107 @@ def test_chunked_mixed_alloc_free_pattern():
         assert t.numel() > 0
 
 
+def _make_chunked(heap_size, **kwargs):
+    """Construct a VMemChunkedAllocator directly for single-rank unit tests."""
+    from iris.host.memory.allocators import VMemChunkedAllocator
+
+    dev = torch.cuda.current_device()
+    return VMemChunkedAllocator(heap_size, dev, 0, 1, **kwargs)
+
+
+def test_chunked_internal_state_not_counted_against_heap():
+    """reserved_bytes is pre-mapped on top of heap_size so the user budget stays usable."""
+    heap_size = 8 << 20
+    reserved = 2 << 20
+
+    baseline = _make_chunked(heap_size)
+    try:
+        base_mapped = baseline.get_stats()["mapped_bytes"]
+    finally:
+        baseline.close()
+
+    alloc = _make_chunked(heap_size, reserved_bytes=reserved)
+    try:
+        gran = alloc.granularity
+        rounded_reserved = -(-reserved // gran) * gran
+        stats = alloc.get_stats()
+        assert stats["reserved_bytes"] == rounded_reserved
+        # The reserved budget is mapped on top of the user heap, not carved out of it.
+        assert stats["mapped_bytes"] >= heap_size + rounded_reserved
+        assert stats["mapped_bytes"] > base_mapped
+        assert stats["usable_bytes"] >= heap_size
+
+        # Consuming the whole internal budget as internal allocations...
+        internal_t = alloc.allocate(rounded_reserved // 4, torch.float32, internal=True)
+        assert alloc.get_stats()["internal_bytes"] >= rounded_reserved
+        # ...still leaves the user able to allocate out of the reserved headroom.
+        user_t = alloc.allocate(heap_size // 4, torch.float32)
+        assert user_t is not None
+        del internal_t, user_t
+    finally:
+        alloc.close()
+
+
+def test_chunked_capacity_report_fields():
+    """get_stats() exposes usable/used/free/largest/internal/reserved with sane invariants."""
+    ctx = iris.iris(4 << 20, allocator_type=ALLOC_TYPE)
+    alloc = ctx.heap.allocator
+    stats = alloc.get_stats()
+    for key in (
+        "reserved_bytes",
+        "internal_bytes",
+        "used_bytes",
+        "free_in_mapped_bytes",
+        "usable_bytes",
+        "largest_allocatable_bytes",
+    ):
+        assert key in stats, f"missing capacity field {key!r}"
+
+    # Iris allocates its device-barrier flags as internal control state.
+    assert stats["internal_bytes"] > 0
+    assert stats["used_bytes"] >= stats["internal_bytes"]
+    assert stats["largest_allocatable_bytes"] <= stats["usable_bytes"]
+
+    before = alloc.get_stats()["used_bytes"]
+    t = ctx.zeros(4096, dtype=torch.float32)
+    after = alloc.get_stats()["used_bytes"]
+    assert after > before
+    del t
+
+
+def test_chunked_sizing_helper_roundtrip():
+    """plan_capacity() predicts a size whose built allocator reports >= the target usable bytes."""
+    from iris.host.memory.allocators import VMemChunkedAllocator
+
+    target = 16 << 20
+    reserved = 1 << 20
+    plan = VMemChunkedAllocator.plan_capacity(target, reserved_bytes=reserved)
+    assert plan["usable_bytes"] >= target
+    assert plan["mapped_bytes"] >= target + plan["reserved_bytes"]
+
+    alloc = _make_chunked(target, reserved_bytes=reserved)
+    try:
+        assert alloc.get_stats()["usable_bytes"] >= target
+    finally:
+        alloc.close()
+
+
+def test_chunked_oom_message_has_breakdown():
+    """An out-of-capacity error prints the capacity breakdown, not an opaque message."""
+    alloc = _make_chunked(1 << 20, chunk_size=1 << 20, va_size=4 << 20)
+    try:
+        tensors = []
+        with pytest.raises(RuntimeError) as excinfo:
+            for _ in range(64):
+                tensors.append(alloc.allocate(256 * 1024, torch.float32))  # 1 MiB each
+        msg = str(excinfo.value).lower()
+        for token in ("usable", "largest", "va_size"):
+            assert token in msg, f"OOM message missing {token!r}: {excinfo.value}"
+        del tensors
+    finally:
+        alloc.close()
+
+
 if __name__ == "__main__":
     test_chunked_creation()
     test_chunked_basic_allocation()
