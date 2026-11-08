@@ -7,7 +7,8 @@ Tests for VMemChunkedAllocator.
 Tests cover:
 - Basic allocation and data integrity
 - Multiple allocations and non-overlap
-- Power-of-two free list reuse via GC, once every rank has freed a block
+- (size, alignment) free-list reuse via GC, once every rank has freed a block
+- Sub-granule packing and exact (non-power-of-two) block sizing
 - Chunk growth on overflow
 - as_symmetric (import external tensor)
 - owns_tensor detection
@@ -132,17 +133,17 @@ def test_chunked_free_list_size_classes():
     """Test that different sizes use different free list buckets.
 
     SymmetricHeap.allocate() bumps element counts to at least
-    granularity / element_size, so we must pick sizes that remain in
-    distinct power-of-two buckets after that rounding.
+    get_minimum_allocation_size() / element_size; we pick sizes well above that
+    floor that land in distinct (size, alignment) buckets after exact rounding.
     """
     ctx = iris.iris(256 << 20, allocator_type=ALLOC_TYPE)
     alloc = ctx.heap.allocator
     elem_size = 4  # float32
 
-    # Compute the minimum element count (the floor imposed by SymmetricHeap)
+    # Granule-sized base unit, so the three sizes are clearly distinct buckets.
     min_elems = max(1, (alloc.granularity + elem_size - 1) // elem_size)
 
-    # Pick three sizes that land in clearly different power-of-two buckets:
+    # Pick three sizes that land in clearly different (size, alignment) buckets:
     #   small  = 1x granularity  (min_elems elements)
     #   medium = 4x granularity  (min_elems * 4 elements)
     #   large  = 16x granularity (min_elems * 16 elements)
@@ -641,8 +642,8 @@ def test_chunked_granularity_reports_min_and_recommended():
 def test_chunked_honors_requested_alignment_above_granule():
     """allocate(alignment=...) above the granule must align the absolute address.
 
-    Repro: before the fix the alignment argument was ignored beyond the fixed min_alignment,
-    so an over-aligned request's data_ptr() was not a multiple of the requested alignment.
+    An over-aligned request's data_ptr() must be a multiple of the requested alignment, not just of
+    the fixed min_alignment.
     """
     ctx = iris.iris(64 << 20, allocator_type=ALLOC_TYPE)
     alloc = ctx.heap.allocator
@@ -685,10 +686,9 @@ def test_chunked_honors_requested_alignment_above_granule():
 def test_chunked_over_aligned_block_returns_bump_to_start():
     """Freeing an over-aligned block must reclaim its alignment padding, not strand it.
 
-    Repro (MAJOR): allocate one granule, then a block aligned to 4*granule (which skips padding
-    to reach the aligned offset), free both and reclaim. Before the fix the bump pointer rolled
-    back only to the aligned offset -- the skipped padding, and every block below it, was lost to
-    free lists and the heap could never shrink back below it.
+    Allocate one granule, then a block aligned to 4*granule (which skips padding to reach the
+    aligned offset), free both and reclaim: the bump pointer must roll back past the padding to its
+    starting value, leaving nothing in free lists.
     """
     ctx = iris.iris(64 << 20, allocator_type=ALLOC_TYPE)
     alloc = ctx.heap.allocator
@@ -732,9 +732,8 @@ def test_chunked_rejects_operations_after_close():
 def test_chunked_import_external_tensor_rejects_after_close():
     """import_external_tensor() after close() must raise, matching allocate()'s guard.
 
-    Repro: before the fix, only allocate() was guarded against use-after-close; this entry
-    point would run past a closed allocator and touch driver/bookkeeping state that close()
-    already tore down.
+    This entry point must not run past a closed allocator and touch driver/bookkeeping state that
+    close() already tore down.
     """
     ctx = iris.iris(4 << 20, allocator_type=ALLOC_TYPE)
     alloc = ctx.heap.allocator
@@ -760,9 +759,8 @@ def test_chunked_import_peer_chunk_rejects_after_close():
 def test_chunked_get_allocation_chunks_since_rejects_after_close():
     """get_allocation_chunks_since() after close() must raise instead of exporting stale chunks.
 
-    Repro: before the fix, this could run after close() released self.chunks/_shared_regions
-    and either return an empty/garbage result or fail deep inside driver.export_handle instead
-    of a clear, immediate error.
+    After close() has released self.chunks/_shared_regions, this must fail with a clear, immediate
+    error rather than returning a garbage result or failing deep inside driver.export_handle.
     """
     ctx = iris.iris(1 << 20, allocator_type=ALLOC_TYPE)
     alloc = ctx.heap.allocator
@@ -774,8 +772,8 @@ def test_chunked_get_allocation_chunks_since_rejects_after_close():
 def test_chunked_non_power_of_two_heap_size():
     """A non-power-of-two heap size below the default chunk must construct, allocate, and grow.
 
-    Repro: 6 MiB with a 2 MiB granule produced a non-power-of-two chunk size and raised
-    "computed chunk_size ... is not a power of two" during construction.
+    A 6 MiB heap with a 2 MiB granule yields a non-power-of-two chunk size, which the arithmetic VA
+    rounding must handle rather than reject during construction.
     """
     ctx = iris.iris(6 << 20, allocator_type=ALLOC_TYPE)
     alloc = ctx.heap.allocator
@@ -805,8 +803,8 @@ def _is_pow2(n):
 def test_chunked_failed_allocation_rolls_back(monkeypatch):
     """A tensor-construction failure must not advance bump/alloc bookkeeping.
 
-    Repro: before the fix, bump and alloc_sizes were mutated before the tensor was
-    built, so a failure left an orphaned reservation (leak) with no finalizer.
+    The tensor is built before bump and alloc_sizes are mutated, so a construction failure must
+    leave no orphaned reservation (which would leak, having no finalizer).
     """
     ctx = iris.iris(4 << 20, allocator_type=ALLOC_TYPE)
     alloc = ctx.heap.allocator
@@ -832,11 +830,10 @@ def test_chunked_failed_allocation_rolls_back(monkeypatch):
 def test_chunked_failed_allocation_rolls_back_free_list_block(monkeypatch):
     """A tensor-construction failure on the free-list reuse path must return the block.
 
-    This exercises the other half of the rollback fix: when allocate() serves a request from
-    free_lists[bucket] (not the bump pointer), it pops the block *before* building the tensor.
-    Repro: before the fix, a construction failure here would drop that offset on the floor --
-    no bump/alloc_sizes damage (that part never ran), but the block would be leaked forever
-    since no finalizer was ever attached to recover it.
+    This exercises the other half of the rollback path: when allocate() serves a request from
+    free_lists[bucket] (not the bump pointer), it pops the block *before* building the tensor, so a
+    construction failure must return that offset to its bucket rather than leak it (no finalizer is
+    ever attached to recover it otherwise).
     """
     ctx = iris.iris(4 << 20, allocator_type=ALLOC_TYPE)
     alloc = ctx.heap.allocator
@@ -928,6 +925,130 @@ def test_chunked_reuses_block_with_larger_alignment(monkeypatch):
     t2 = alloc.allocate(1024, torch.float32)  # default alignment < big_align
     assert alloc.bump == bump_before, "expected cross-alignment free-list reuse, not a bump allocation"
     assert (t2.data_ptr() - alloc.get_base_address()) == offset
+
+
+def test_chunked_small_objects_pack_at_the_quantum_not_the_granule():
+    """Small allocations pack at the MIN_ALIGNMENT quantum instead of each consuming a granule.
+
+    N tiny tensors are strided one quantum apart and occupy N quanta of layout, not N granules.
+    The assertion is hardware-agnostic: it checks the stride is the quantum, which holds whether the
+    recommended granule is 4 KiB or 2 MiB.
+    """
+    ctx = iris.iris(64 << 20, allocator_type=ALLOC_TYPE)
+    alloc = ctx.heap.allocator
+    base = alloc.get_base_address()
+    quantum = alloc.min_alignment
+    assert quantum < alloc.granularity, "packing only matters when the quantum is sub-granule"
+
+    chunks_before = alloc.get_num_chunks()
+    # Each tiny table is 64 int32 = 256 bytes, far under a granule.
+    tensors = [ctx.zeros(64, dtype=torch.int32) for _ in range(32)]
+    offsets = sorted(t.data_ptr() - base for t in tensors)
+
+    # Consecutive small blocks are exactly one quantum apart (tight packing), not a granule apart.
+    deltas = {offsets[i + 1] - offsets[i] for i in range(len(offsets) - 1)}
+    assert deltas == {quantum}, f"expected packed {quantum}-strided blocks, got deltas {deltas}"
+    # The whole batch occupies n quanta of layout and fits in already-mapped space (no chunk growth).
+    assert offsets[-1] - offsets[0] == (len(tensors) - 1) * quantum
+    assert alloc.get_num_chunks() == chunks_before
+
+
+def test_chunked_large_allocation_is_not_power_of_two_inflated():
+    """A large allocation consumes its exact (quantum-rounded) size, not the next power of two.
+
+    A request just over a power of two rounds only up to the MIN_ALIGNMENT quantum, so its block
+    size stays well below the next power of two.
+    """
+    ctx = iris.iris(256 << 20, allocator_type=ALLOC_TYPE)
+    alloc = ctx.heap.allocator
+    base = alloc.get_base_address()
+    quantum = alloc.min_alignment
+
+    # Just over a power of two: the granule is a power-of-two multiple, so +1 quantum tips it over.
+    size_bytes = alloc.granularity + quantum
+    t = ctx.zeros(size_bytes // 4, dtype=torch.float32)
+    offset = t.data_ptr() - base
+
+    expected = (size_bytes + quantum - 1) & ~(quantum - 1)  # exact rounding; == size_bytes here
+    assert alloc.alloc_sizes[offset] == expected, f"block size {alloc.alloc_sizes[offset]} != exact {expected}"
+
+    # Strictly smaller than next-power-of-two-then-granule rounding would produce.
+    pow2_granule_size = vmem_chunked_module._next_power_of_two(size_bytes)
+    pow2_granule_size = (pow2_granule_size + alloc.granularity - 1) & ~(alloc.granularity - 1)
+    assert expected < pow2_granule_size, f"exact {expected} should be smaller than pow2/granule {pow2_granule_size}"
+
+
+def test_chunked_over_aligned_small_request_keeps_small_block():
+    """An over-aligned small request keeps a small block; only its address is aligned.
+
+    Guards the size/alignment decoupling: the block is rounded to MIN_ALIGNMENT (not to
+    effective_align), so a 4 KiB request with a huge alignment still occupies a small block while
+    data_ptr() is aligned via bump padding.
+    """
+    ctx = iris.iris(64 << 20, allocator_type=ALLOC_TYPE)
+    alloc = ctx.heap.allocator
+    base = alloc.get_base_address()
+    alignment = 4 * alloc.granularity  # >> the request size
+
+    size_bytes = 4096
+    t = alloc.allocate(size_bytes // 4, torch.float32, alignment=alignment)
+    assert t is not None
+    offset = t.data_ptr() - base
+
+    expected = (size_bytes + alloc.min_alignment - 1) & ~(alloc.min_alignment - 1)
+    assert alloc.alloc_sizes[offset] == expected, "block size must not inflate to the alignment"
+    assert alloc.alloc_sizes[offset] < alignment
+    assert t.data_ptr() % alignment == 0, "the absolute address must still be aligned"
+
+
+def test_chunked_min_allocation_size_is_quantum_not_granule():
+    """get_minimum_allocation_size() is the sub-granule quantum; a 1-element tensor is that small.
+
+    SymmetricHeap floors element counts to this, so even a 1-element tensor occupies just one
+    quantum rather than a whole granule.
+    """
+    ctx = iris.iris(4 << 20, allocator_type=ALLOC_TYPE)
+    alloc = ctx.heap.allocator
+    assert alloc.get_minimum_allocation_size() == alloc.min_alignment
+    assert alloc.get_minimum_allocation_size() < alloc.granularity
+
+    base = alloc.get_base_address()
+    t = ctx.zeros(1, dtype=torch.float32)
+    offset = t.data_ptr() - base
+    assert alloc.alloc_sizes[offset] == alloc.min_alignment
+
+
+def test_chunked_distinct_allocations_never_share_a_cache_line():
+    """Distinct allocations are >= MIN_ALIGNMENT apart, so no two share a coherence cache line.
+
+    This is the invariant that makes packing free on the multi-GPU hot path: a granule is a
+    physical-mapping unit, not a coherence unit, and MIN_ALIGNMENT (1 KiB) >> a 64-128 B line, so
+    a hot cross-rank flag cannot false-share a line with a neighbor even when they share a granule.
+    """
+    ctx = iris.iris(4 << 20, allocator_type=ALLOC_TYPE)
+    alloc = ctx.heap.allocator
+    assert alloc.min_alignment >= 128, "MIN_ALIGNMENT must be at least a cache line"
+    base = alloc.get_base_address()
+    a = ctx.zeros(1, dtype=torch.int32)
+    b = ctx.zeros(1, dtype=torch.int32)
+    assert abs((a.data_ptr() - base) - (b.data_ptr() - base)) >= alloc.min_alignment
+
+
+def test_chunked_small_alloc_offsets_symmetric_across_ranks():
+    """Packed sub-granule allocations land at identical offsets on every rank.
+
+    Packing increases how many allocations share a granule, so re-assert the core symmetric-heap
+    invariant specifically for small objects (test_chunked_offsets_symmetric_across_gc_timing
+    exercises larger ones).
+    """
+    ctx = iris.iris(8 << 20, allocator_type=ALLOC_TYPE)
+    if ctx.num_ranks < 2:
+        pytest.skip("Requires at least 2 ranks")
+    tensors = [ctx.zeros(48, dtype=torch.int32) for _ in range(10)]
+    for t in tensors:
+        offsets = _offsets_per_rank(ctx, t)
+        assert len(set(offsets)) == 1, f"offsets differ across ranks: {offsets}"
+    ctx.barrier()
 
 
 if __name__ == "__main__":

@@ -2,14 +2,14 @@
 # Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 
 """
-Chunked VMem allocator with power-of-two free lists and GC-based deallocation.
+Chunked VMem allocator with size/alignment-keyed free lists and GC-based deallocation.
 
 Design:
 - Reserve large VA range up front (cheap, just address space)
 - Map physical memory in large chunks (e.g. 256 MiB)
 - Driver applies access once per chunk (not per allocation)
-- Sub-allocate from chunks with bump pointer
-- Power-of-two free lists for O(1) alloc/free reuse
+- Sub-allocate from chunks with a bump pointer, packing many sub-granule blocks per granule
+- (size, alignment)-keyed free lists for O(1) alloc/free reuse
 - GC via weakref finalizers on tensor.untyped_storage()
 - Free/reuse is pure bookkeeping (no driver calls, no physical remap)
 - A block becomes reusable only once every rank has freed it (see reuse()),
@@ -96,7 +96,7 @@ class Bucket(NamedTuple):
 
 class VMemChunkedAllocator(BaseAllocator):
     """
-    Chunked VMem allocator with power-of-two free lists.
+    Chunked VMem allocator with (size, alignment)-keyed free lists.
 
     Physical memory is allocated in large chunks that are mapped once and
     never remapped. Free/reuse is pure bookkeeping -- no driver calls, no
@@ -147,6 +147,12 @@ class VMemChunkedAllocator(BaseAllocator):
     MAX_ALIGNMENT = 256 * 1024 * 1024
     # Reconcile frees (SymmetricHeap.collect()) after handing out 1/COLLECT_FRACTION of the mapped heap
     COLLECT_FRACTION = 8
+    # Minimum per-allocation alignment, and the quantum the block size is rounded up to. It is the
+    # layout granularity for small objects, which pack many to a granule. Kept well above a cache
+    # line (64-128 B) so two distinct allocations never share a coherence line -- a granule is a
+    # physical-mapping unit, not a coherence unit, so packing many blocks into one granule costs
+    # nothing in cross-rank atomic traffic.
+    MIN_ALIGNMENT = 1024
 
     def __init__(
         self,
@@ -277,7 +283,9 @@ class VMemChunkedAllocator(BaseAllocator):
         self._max_alignment = max(self.granularity, self.MAX_ALIGNMENT)
         self.base_va = self.driver.reserve_va(self.va_size, self._max_alignment)
 
-        self.min_alignment = max(self.granularity, 1024)
+        # Minimum alignment / block-size quantum, decoupled from the granule: small objects pack
+        # sub-granule (a 256 B object shares a granule) and larger requests round to this quantum.
+        self.min_alignment = self.MIN_ALIGNMENT
 
         # Pre-allocate initial chunks to cover heap_size
         n_initial_chunks = max(1, math.ceil(heap_size / self.chunk_size))
@@ -380,7 +388,10 @@ class VMemChunkedAllocator(BaseAllocator):
         return self._max_alignment
 
     def get_minimum_allocation_size(self) -> int:
-        return self.granularity
+        # SymmetricHeap.allocate() floors element counts to this, so the quantum is the smallest
+        # allocation: a sub-granule request (e.g. an int32[R, R] barrier table) is placed as a
+        # single quantum rather than a whole granule.
+        return self.min_alignment
 
     def get_device(self) -> torch.device:
         return self.device
@@ -454,10 +465,6 @@ class VMemChunkedAllocator(BaseAllocator):
 
             elem_size = _element_size(dtype)
             size_bytes = num_elements * elem_size
-            # Minimum allocation is one granule
-            size_bytes = max(size_bytes, self.granularity)
-            # Round to next power of two for free-list bucketing
-            size_class = _next_power_of_two(size_bytes)
             # Effective alignment: at least min_alignment, raised to honor an over-aligned
             # request. Rounded to a power of two so the bitmask alignment math holds.
             effective_align = max(self.min_alignment, _next_power_of_two(max(1, alignment)))
@@ -468,10 +475,13 @@ class VMemChunkedAllocator(BaseAllocator):
                     f"The heap base is reserved aligned to {self._max_alignment}; a larger alignment "
                     f"cannot be guaranteed on the absolute address. Raise MAX_ALIGNMENT or request less."
                 )
-            # Block size is independent of alignment: the bucket key already records the alignment,
-            # so an over-aligned request no longer inflates the block (a 4 KiB request with 64 MiB
-            # alignment stays a granule, not 64 MiB). Alignment is handled by padding the bump below.
-            aligned_size = (size_class + self.granularity - 1) & ~(self.granularity - 1)
+            # Round the block size up to the min_alignment quantum (a power of two, so the bitmask
+            # holds). Sub-granule requests pack into a shared granule and a larger request consumes
+            # only its rounded size. The quantum is min_alignment, NOT effective_align, so an
+            # over-aligned request keeps a small block (a 4 KiB request with 64 MiB alignment stays
+            # 4 KiB): the bucket key records the alignment and the bump padding below places the
+            # block, keeping size and alignment decoupled.
+            aligned_size = (size_bytes + self.min_alignment - 1) & ~(self.min_alignment - 1)
             bucket = Bucket(aligned_size, effective_align)
 
             pad_start: Optional[int] = None
