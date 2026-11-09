@@ -20,7 +20,7 @@ import numpy as np
 import torch
 
 from iris.host.logging.logging import _log_rank
-from iris.host.memory.allocators import TorchAllocator, VMemAllocator, VMemChunkedAllocator
+from iris.host.memory.allocators import LayoutFingerprint, TorchAllocator, VMemAllocator, VMemChunkedAllocator
 from iris.drivers.base import MappingPlacement, PeerMapping
 from iris.host.distributed.fd_passing import setup_fd_infrastructure
 from iris.host.distributed.helpers import distributed_allgather
@@ -81,6 +81,7 @@ def _validate_local_handle(handle_bytes: bytes) -> None:
 
 _hostname_exchanges = itertools.count(1)
 _released_exchanges = itertools.count(1)
+_layout_exchanges = itertools.count(1)
 
 
 def _hostnames_by_rank(num_ranks: int) -> List[str]:
@@ -118,6 +119,46 @@ def _released_by_every_rank(offsets: List[int], num_ranks: int) -> List[int]:
     for key in keys:
         common &= set(np.frombuffer(store.get(key), dtype=np.int64).tolist())
     return sorted(common)
+
+
+def _layout_agreed_across_ranks(fingerprint: LayoutFingerprint, num_ranks: int, op: str) -> None:
+    """Raise if any rank's heap-layout fingerprint differs from rank 0's.
+
+    Exchanged through the rendezvous store (control metadata, no NCCL collective), mirroring
+    _released_by_every_rank. The fingerprint is a small rank-invariant tuple (see
+    VMemChunkedAllocator.layout_fingerprint); a mismatch means some rank issued a different
+    sequence of symmetric allocations, which silently desynchronizes every later offset. ``op`` is
+    the calling entry point, used only to attribute a store timeout to the right method.
+    """
+    import torch.distributed as dist
+
+    store = dist.distributed_c10d._get_default_store()
+    rank = dist.get_rank()
+    exchange = next(_layout_exchanges)
+    prefix = f"iris_layout_v{exchange}/"
+    store.set(f"{prefix}{rank}", np.asarray(fingerprint, dtype=np.int64).tobytes())
+    keys = [f"{prefix}{r}" for r in range(num_ranks)]
+    try:
+        store.wait(keys)
+    except dist.DistStoreError as exc:
+        missing = [r for r, key in enumerate(keys) if not store.check([key])]
+        raise TimeoutError(
+            f"SymmetricHeap.{op}(): timed out after {store.timeout.total_seconds():.0f}s "
+            f"(the store's timeout) waiting for ranks {missing}; symmetric allocations must happen on every "
+            f"rank in the same order"
+        ) from exc
+    if exchange > 1:
+        store.delete_key(f"iris_layout_v{exchange - 1}/{rank}")
+    fingerprints = [LayoutFingerprint(*np.frombuffer(store.get(key), dtype=np.int64).tolist()) for key in keys]
+    reference = fingerprints[0]
+    diverged = {r: fp for r, fp in enumerate(fingerprints) if fp != reference}
+    if diverged:
+        detail = ", ".join(f"rank{r}={fp}" for r, fp in diverged.items())
+        raise RuntimeError(
+            f"SymmetricHeap layout diverged across ranks: rank0={reference}; {detail}. "
+            "Some rank issued a different sequence of symmetric allocations -- every rank must allocate the "
+            "same tensors in the same order, or every later offset desynchronizes."
+        )
 
 
 def _require_single_host(allocator_type: str, hostnames: List[str]) -> None:
@@ -324,6 +365,25 @@ class SymmetricHeap:
         if self._peer_refresh_failed:
             raise RuntimeError(self._PEER_REFRESH_FAILURE_MESSAGE)
 
+    def _reject_during_graph_capture(self, op: str) -> None:
+        """Raise if a collective heap op is attempted while a CUDA/HIP graph is capturing.
+
+        Symmetric allocation and reclamation are collective: they synchronize the device, barrier
+        across ranks, exchange control metadata through the store, and remap peer VA. None of that
+        is legal on a capturing stream -- the driver otherwise surfaces a cryptic "operation not
+        permitted when stream is capturing" or hangs. Fail early with an actionable message.
+        """
+        # getattr guard: older torch builds may lack is_current_stream_capturing; absence just means
+        # no capture detection (the pre-existing behavior), never a hard failure on every allocate().
+        is_capturing = getattr(torch.cuda, "is_current_stream_capturing", None)
+        if torch.cuda.is_available() and is_capturing is not None and is_capturing():
+            raise RuntimeError(
+                f"SymmetricHeap.{op}() is a collective operation (device sync, cross-rank "
+                f"store/barrier, peer remap) and cannot run while a CUDA/HIP graph is capturing. "
+                f"Allocate every symmetric tensor before starting capture, then capture only the "
+                f"compute that uses them."
+            )
+
     def _peer_va_size(self) -> int:
         if isinstance(self.allocator, (VMemAllocator, VMemChunkedAllocator)):
             return self.allocator.va_size
@@ -359,6 +419,7 @@ class SymmetricHeap:
         )
 
         self._ensure_peer_refresh_healthy()
+        self._reject_during_graph_capture("allocate")
 
         min_bytes = self.allocator.get_minimum_allocation_size()
         element_size = torch.tensor([], dtype=dtype).element_size()
@@ -490,6 +551,20 @@ class SymmetricHeap:
         offset = ptr - from_base
         return to_base + offset
 
+    def check_symmetric_layout(self) -> None:
+        """Collective: verify every rank's heap layout still agrees, and raise naming the divergence.
+
+        A rank that issues even one extra or differently-sized symmetric allocation shifts every later
+        offset with no error today; it only surfaces much later (a store timeout in ``collect()``, or a
+        silently wrong reuse). Call this at a safe collective point -- e.g. right after building a
+        workspace -- to turn that into an immediate, precise error. Like ``allocate()``/``collect()``,
+        every rank must call it in the same order. No-op for non-chunked allocators and single-rank jobs.
+        """
+        self._reject_during_graph_capture("check_symmetric_layout")
+        if not isinstance(self.allocator, VMemChunkedAllocator) or self.num_ranks < 2:
+            return
+        _layout_agreed_across_ranks(self.allocator.layout_fingerprint(), self.num_ranks, "check_symmetric_layout")
+
     def collect(self):
         """
         Collective: make the heap memory that every rank has freed reusable.
@@ -504,12 +579,18 @@ class SymmetricHeap:
         ``Iris.quiet()`` before dropping their tensors.
 
         Each call runs ``gc.collect()``, a device-wide ``torch.cuda.synchronize()`` that breaks CPU/GPU
-        overlap, and a store round-trip with every rank. Do not call it every step.
+        overlap, and two store round-trips with every rank (a layout-agreement check, then the
+        released-offset exchange). Do not call it every step.
         """
+        self._reject_during_graph_capture("collect")
         if not isinstance(self.allocator, VMemChunkedAllocator):
             return
         gc.collect()
         torch.cuda.synchronize(self.device_id)
+        # Catch a divergent allocation sequence here -- the exact point it otherwise surfaces as an
+        # opaque store timeout or a silently wrong reuse -- and raise a precise error naming the ranks.
+        if self.num_ranks > 1:
+            _layout_agreed_across_ranks(self.allocator.layout_fingerprint(), self.num_ranks, "collect")
         released = self.allocator.released_offsets()
         if self.num_ranks > 1:
             released = _released_by_every_rank(released, self.num_ranks)
@@ -527,6 +608,7 @@ class SymmetricHeap:
         against possibly-stale mapping state.
         """
         self._ensure_peer_refresh_healthy()
+        self._reject_during_graph_capture("refresh_peer_access")
         try:
             self._refresh_peer_access_impl()
         except Exception as exc:
@@ -951,6 +1033,7 @@ class SymmetricHeap:
             RuntimeError: If allocator doesn't support imports or import fails
         """
         self._ensure_peer_refresh_healthy()
+        self._reject_during_graph_capture("as_symmetric")
 
         if not hasattr(self.allocator, "import_external_tensor"):
             raise RuntimeError(f"{type(self.allocator).__name__} does not support as_symmetric().")

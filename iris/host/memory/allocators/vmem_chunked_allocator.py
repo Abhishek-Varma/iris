@@ -27,7 +27,7 @@ import logging
 import weakref
 from collections import defaultdict, deque
 from threading import Lock
-from typing import List, Optional
+from typing import List, NamedTuple, Optional
 
 import torch
 
@@ -41,6 +41,21 @@ from iris.host.distributed.topology import (
 )
 
 logger = logging.getLogger("iris.host.memory.allocators.vmem_chunked_allocator")
+
+# 63-bit FNV-style mixing for the allocation-sequence fingerprint (see layout_fingerprint); masked to
+# stay a non-negative int64 so it round-trips through the store's np.int64 layout exchange.
+_SEQ_HASH_MASK = (1 << 63) - 1
+_SEQ_HASH_PRIME = 1099511628211
+
+
+class LayoutFingerprint(NamedTuple):
+    """Rank-invariant summary of the heap layout, exchanged across ranks (see layout_fingerprint)."""
+
+    bump: int
+    mapped_extent: int
+    num_chunks: int
+    num_allocs: int
+    seq_hash: int
 
 
 # Module-level CUDAArrayInterface to avoid repeated class creation
@@ -157,6 +172,11 @@ class VMemChunkedAllocator(BaseAllocator):
         self._released = {}
         # Bytes handed out since the last reuse(): identical on every rank, like the allocation sequence
         self._bytes_since_collect = 0
+        # Append-only fingerprint of the (offset, size) sequence handed out, order-sensitive and
+        # rank-invariant (frees never touch it; reuse() is driven by the symmetric collect() set).
+        # Detects a divergent allocation order/partition that leaves bump/mapped_extent unchanged.
+        self._alloc_seq_count = 0
+        self._alloc_seq_hash = 0
         self.chunks: List[LocalAllocation] = []
         self._shared_regions: List[ExportableMemory] = []
         self._peer_mappings: List[PeerMapping] = []
@@ -281,6 +301,28 @@ class VMemChunkedAllocator(BaseAllocator):
         with self.lock:
             return self._bytes_since_collect >= self.mapped_extent // self.COLLECT_FRACTION
 
+    def layout_fingerprint(self) -> LayoutFingerprint:
+        """A rank-invariant summary of the heap layout:
+        ``(bump, mapped_extent, num_chunks, num_allocs, seq_hash)``.
+
+        All five advance identically on every rank given an identical allocate()/collect() sequence.
+        ``bump`` only moves on bump allocations and on reuse() (driven by the cross-rank common set
+        from collect()); ``mapped_extent``/chunk count grow identically; and ``num_allocs``/``seq_hash``
+        are an append-only, order-sensitive fold of every (offset, size) handed out. ``seq_hash`` is
+        what catches a divergence that leaves ``bump`` unchanged -- e.g. the same sizes allocated in a
+        different order, or one logical allocation split into differently-sized calls. The fingerprint
+        deliberately excludes the live-allocation set, which differs across ranks by GC timing, so a
+        free on one rank but not another never produces a false positive.
+        """
+        with self.lock:
+            return LayoutFingerprint(
+                bump=self.bump,
+                mapped_extent=self.mapped_extent,
+                num_chunks=len(self.chunks),
+                num_allocs=self._alloc_seq_count,
+                seq_hash=self._alloc_seq_hash,
+            )
+
     def reuse(self, offsets) -> None:
         """
         Make released blocks reusable, and return every free block at the top of the heap (released
@@ -389,6 +431,10 @@ class VMemChunkedAllocator(BaseAllocator):
             # Track for free
             self.alloc_sizes[offset] = aligned_size
             self._bytes_since_collect += aligned_size
+            # Fold this (offset, size) into the order-sensitive allocation-sequence fingerprint.
+            seq = (self._alloc_seq_hash ^ (offset & _SEQ_HASH_MASK)) * _SEQ_HASH_PRIME & _SEQ_HASH_MASK
+            self._alloc_seq_hash = (seq ^ (aligned_size & _SEQ_HASH_MASK)) * _SEQ_HASH_PRIME & _SEQ_HASH_MASK
+            self._alloc_seq_count += 1
 
             # Create tensor via CUDAArrayInterface
             va = self.base_va + offset
